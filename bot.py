@@ -6,9 +6,11 @@ import pytz
 # ============================================
 # CONFIGURATION
 # ============================================
-TELEGRAM_TOKEN = "8945898520:AAF_649VQU70qrpMA1TO6MHcvPHNthzF6_s"
-TELEGRAM_CHAT_ID = "880351739"
-TWELVEDATA_API_KEY = "4c6c2871085a40f5a7d110bf14463daf"
+import os
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 SYMBOL = "GBP/JPY"
 CAPITAL = 200
 RISK_PERCENT = 0.05        # 5% = $10
