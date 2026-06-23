@@ -8,16 +8,39 @@ import pytz
 # ============================================
 import os
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
-SYMBOL = "GBP/JPY"
-CAPITAL = 200
-RISK_PERCENT = 0.05        # 5% = $10
-RISK_AMOUNT = CAPITAL * RISK_PERCENT
-MAX_TRADES_PER_DAY = 3
-MIN_CONFIDENCE = 80        # Only 80%+ signals
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID")
+TWELVEDATA_API_KEY  = os.environ.get("TWELVEDATA_API_KEY")
+
+SYMBOL = "XAU/USD"
+
+# ⚠️ SET THIS TO YOUR ACTUAL CURRENT BALANCE — NOT YOUR ORIGINAL CAPITAL.
+# Risk sizing is meaningless if this number is wrong.
+CAPITAL = 100  # <-- CHANGE THIS to your real current balance before running
+
+RISK_PERCENT       = 0.03          # 3% per trade (reduced from 5% given drawdown)
+RISK_AMOUNT        = CAPITAL * RISK_PERCENT
+MAX_TRADES_PER_DAY  = 2            # reduced from 3 — fewer, higher quality only
+MIN_CONFIDENCE      = 80
 IST = pytz.timezone('Asia/Kolkata')
+
+# PAPER MODE: if True, bot only LOGS signals to Telegram with a clear
+# "PAPER SIGNAL — NOT EXECUTED" label. No claim is made that any trade
+# is placed or guaranteed to work. Recommended to leave True for now.
+PAPER_MODE = True
+
+# ============================================
+# GOLD CONTRACT SPECS (IMPORTANT — DIFFERENT FROM FOREX)
+# ============================================
+# XAU/USD price is quoted in USD per troy ounce, e.g. 4200.50
+# 1 "point" here = $0.01 move in price (we define point = 1 cent for granularity)
+# Standard lot (1.00) = 100 oz → $1 move in price = $100 P&L per 1.00 lot
+# So per 0.01 lot (micro), $1 move in price = $1 P&L
+# Therefore: value per point (0.01 price move) per 0.01 lot ≈ $0.01 per point... 
+# but most retail brokers quote gold in $0.01 increments and call a "point" = $0.01 move.
+# We use the broker-standard convention below — VERIFY against your own broker's
+# contract specification before trusting this in execution, as conventions vary.
+GOLD_POINT_VALUE_PER_001_LOT = 0.01  # $ P&L per 1 point (0.01 USD) move per 0.01 lot
 
 # ============================================
 # STATE
@@ -115,33 +138,28 @@ def analyze_structure(candles):
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return "NEUTRAL", 0
 
-    # Last 2 swing highs and lows
     sh1, sh2 = swing_highs[-2][1], swing_highs[-1][1]
     sl1, sl2 = swing_lows[-2][1],  swing_lows[-1][1]
 
     bullish_score = 0
     bearish_score = 0
 
-    # Higher Highs = bullish
     if sh2 > sh1:
         bullish_score += 1
     else:
         bearish_score += 1
 
-    # Higher Lows = bullish
     if sl2 > sl1:
         bullish_score += 1
     else:
         bearish_score += 1
 
-    # Recent close direction
     recent_closes = [c["close"] for c in candles[-5:]]
     if recent_closes[-1] > recent_closes[0]:
         bullish_score += 1
     else:
         bearish_score += 1
 
-    # EMA cross approximation (fast vs slow)
     closes = [c["close"] for c in candles]
     ema_fast = sum(closes[-10:]) / 10
     ema_slow = sum(closes[-30:]) / 30
@@ -181,21 +199,19 @@ def detect_liquidity_grab(candles):
     score = 0
     grab  = None
 
-    # Bearish grab: spike above high, close back below
     if prev["high"] > max_high:
         wick_size = prev["high"] - max(prev["open"], prev["close"])
         body_size = abs(prev["open"] - prev["close"])
-        if wick_size > body_size * 1.5:  # Wick 1.5x bigger than body
-            if curr["close"] < curr["open"]:  # Next candle bearish
+        if wick_size > body_size * 1.5:
+            if curr["close"] < curr["open"]:
                 grab  = "BEARISH_GRAB"
                 score = 2
 
-    # Bullish grab: spike below low, close back above
     if prev["low"] < min_low:
         wick_size = min(prev["open"], prev["close"]) - prev["low"]
         body_size = abs(prev["open"] - prev["close"])
         if wick_size > body_size * 1.5:
-            if curr["close"] > curr["open"]:  # Next candle bullish
+            if curr["close"] > curr["open"]:
                 grab  = "BULLISH_GRAB"
                 score = 2
 
@@ -205,7 +221,6 @@ def detect_liquidity_grab(candles):
 # SUPPORT & RESISTANCE (KEY LEVELS)
 # ============================================
 def get_sr_levels(candles_1h, candles_5m):
-    # 1H levels (stronger)
     h1_highs = sorted([c["high"] for c in candles_1h[-30:]], reverse=True)
     h1_lows  = sorted([c["low"]  for c in candles_1h[-30:]])
 
@@ -214,12 +229,16 @@ def get_sr_levels(candles_1h, candles_5m):
 
     current = candles_5m[-1]["close"]
 
-    # Distance from S&R
-    dist_resistance = abs(resistance - current) / current * 1000
-    dist_support    = abs(current - support)    / current * 1000
+    # Gold moves in dollars, not the same scale as GBPJPY.
+    # Distance expressed in actual $ price difference (not x1000).
+    dist_resistance = abs(resistance - current)
+    dist_support    = abs(current - support)
 
-    near_resistance = dist_resistance < 50   # Within 50 points
-    near_support    = dist_support    < 50
+    # "Near" threshold for gold = $8 (tunable). Gold's average true range
+    # on 5m is typically $3-8, so this keeps it comparable in spirit
+    # to the 50-point GBPJPY threshold, scaled to gold's actual volatility.
+    near_resistance = dist_resistance < 8
+    near_support    = dist_support    < 8
 
     return support, resistance, near_support, near_resistance
 
@@ -230,36 +249,31 @@ def check_candle_pattern(candles):
     if len(candles) < 3:
         return None, 0
 
-    c1 = candles[-3]
     c2 = candles[-2]
     c3 = candles[-1]
 
     score = 0
     pattern = None
 
-    # Bearish engulfing
-    if (c2["open"] < c2["close"] and   # c2 bullish
-        c3["open"] > c3["close"] and   # c3 bearish
+    if (c2["open"] < c2["close"] and
+        c3["open"] > c3["close"] and
         c3["open"] >= c2["close"] and
         c3["close"] <= c2["open"]):
         pattern = "BEARISH_ENGULF"
         score   = 2
 
-    # Bullish engulfing
-    elif (c2["open"] > c2["close"] and  # c2 bearish
-          c3["open"] < c3["close"] and  # c3 bullish
+    elif (c2["open"] > c2["close"] and
+          c3["open"] < c3["close"] and
           c3["open"] <= c2["close"] and
           c3["close"] >= c2["open"]):
         pattern = "BULLISH_ENGULF"
         score   = 2
 
-    # Shooting star (bearish)
     elif (c3["high"] - max(c3["open"], c3["close"]) >
           2 * abs(c3["open"] - c3["close"])):
         pattern = "SHOOTING_STAR"
         score   = 1
 
-    # Hammer (bullish)
     elif (min(c3["open"], c3["close"]) - c3["low"] >
           2 * abs(c3["open"] - c3["close"])):
         pattern = "HAMMER"
@@ -268,7 +282,7 @@ def check_candle_pattern(candles):
     return pattern, score
 
 # ============================================
-# RSI APPROXIMATION
+# RSI
 # ============================================
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -305,28 +319,36 @@ def detect_fvg(candles):
         return None, 0
 
     c1 = candles[-3]
-    c2 = candles[-2]
     c3 = candles[-1]
 
-    # Bullish FVG: c1 high < c3 low (gap between c1 and c3)
     if c1["high"] < c3["low"]:
         return "BULLISH_FVG", 1
 
-    # Bearish FVG: c1 low > c3 high
     if c1["low"] > c3["high"]:
         return "BEARISH_FVG", 1
 
     return None, 0
 
 # ============================================
-# CALCULATE LOTS
+# CALCULATE LOTS — GOLD SPECIFIC, CAPITAL AWARE
 # ============================================
-def calculate_lots(sl_points):
+def calculate_lots(sl_dollars):
+    """
+    sl_dollars: stop loss distance in actual USD price terms (e.g. 6.50 means $6.50 move)
+    Returns lot size so that if SL is hit, loss ≈ RISK_AMOUNT (never more).
+    """
+    if sl_dollars <= 0:
+        return 0.01
+
+    # Points here = cents. $1 = 100 points (cents).
+    sl_points = sl_dollars * 100
+
     if sl_points <= 0:
         return 0.01
-    # GBP/JPY: ~$0.09 per point per 0.01 lot
-    pip_value = 0.09
-    lots = RISK_AMOUNT / (sl_points * pip_value)
+
+    lots = RISK_AMOUNT / (sl_points * GOLD_POINT_VALUE_PER_001_LOT)
+    # Convert to lot units (lots variable currently in units of 0.01 lot)
+    lots = lots * 0.01
     lots = round(min(max(lots, 0.01), 0.50), 2)
     return lots
 
@@ -339,7 +361,6 @@ def generate_signal(candles_5m, candles_1h):
 
     current_price = candles_5m[-1]["close"]
 
-    # --- ANALYSIS LAYERS ---
     h1_structure, h1_score  = analyze_structure(candles_1h)
     m5_structure, m5_score  = analyze_structure(candles_5m)
     liquidity, liq_score    = detect_liquidity_grab(candles_5m)
@@ -349,120 +370,105 @@ def generate_signal(candles_5m, candles_1h):
     rsi = calculate_rsi(candles_5m)
 
     print(f"\n--- ANALYSIS ---")
-    print(f"Price: {current_price:.3f}")
+    print(f"Price: {current_price:.2f}")
     print(f"H1 Structure: {h1_structure} (score {h1_score})")
     print(f"M5 Structure: {m5_structure} (score {m5_score})")
     print(f"Liquidity: {liquidity}")
     print(f"Pattern: {pattern}")
     print(f"FVG: {fvg}")
     print(f"RSI: {rsi}")
-    print(f"Support: {support:.3f} | Resistance: {resistance:.3f}")
+    print(f"Support: {support:.2f} | Resistance: {resistance:.2f}")
 
-    # ----------------------------------------
-    # LONG CONDITIONS (SCORED)
-    # ----------------------------------------
     long_score = 0
     long_reasons = []
 
     if h1_structure == "BULLISH":
         long_score += 30
         long_reasons.append("H1 Bullish Structure")
-
     if m5_structure == "BULLISH":
         long_score += 15
         long_reasons.append("M5 Bullish Structure")
-
     if liquidity == "BULLISH_GRAB":
         long_score += 20
         long_reasons.append("Bullish Liquidity Grab")
-
     if pattern in ["BULLISH_ENGULF", "HAMMER"]:
         long_score += pat_score * 8
         long_reasons.append(f"Pattern: {pattern}")
-
     if fvg == "BULLISH_FVG":
         long_score += 10
         long_reasons.append("Bullish FVG")
-
     if near_support:
         long_score += 10
         long_reasons.append("Near Support Level")
-
     if rsi < 40:
         long_score += 10
         long_reasons.append(f"RSI Oversold ({rsi})")
 
-    # ----------------------------------------
-    # SHORT CONDITIONS (SCORED)
-    # ----------------------------------------
     short_score = 0
     short_reasons = []
 
     if h1_structure == "BEARISH":
         short_score += 30
         short_reasons.append("H1 Bearish Structure")
-
     if m5_structure == "BEARISH":
         short_score += 15
         short_reasons.append("M5 Bearish Structure")
-
     if liquidity == "BEARISH_GRAB":
         short_score += 20
         short_reasons.append("Bearish Liquidity Grab")
-
     if pattern in ["BEARISH_ENGULF", "SHOOTING_STAR"]:
         short_score += pat_score * 8
         short_reasons.append(f"Pattern: {pattern}")
-
     if fvg == "BEARISH_FVG":
         short_score += 10
         short_reasons.append("Bearish FVG")
-
     if near_resistance:
         short_score += 10
         short_reasons.append("Near Resistance Level")
-
     if rsi > 60:
         short_score += 10
         short_reasons.append(f"RSI Overbought ({rsi})")
 
     print(f"Long Score: {long_score} | Short Score: {short_score}")
 
-    # ----------------------------------------
-    # DETERMINE SIGNAL
-    # ----------------------------------------
     signal    = None
     score     = 0
     reasons   = []
-    sl_points = 0
-    tp_points = 0
+    sl_dollars = 0
+    tp_dollars = 0
+
+    # Minimum SL distance for gold on 5m/H1 confluence — gold whipsaws hard,
+    # a too-tight SL here gets stop-hunted constantly. $4 floor is intentional.
+    MIN_SL_DOLLARS = 4.0
 
     if long_score > short_score and long_score >= MIN_CONFIDENCE:
-        signal    = "LONG"
-        score     = min(long_score, 99)
-        reasons   = long_reasons
-        sl_points = max(int((current_price - support) * 1000) + 30, 80)
-        tp_points = sl_points * 2
+        signal     = "LONG"
+        score      = min(long_score, 99)
+        reasons    = long_reasons
+        sl_dollars = max(current_price - support, MIN_SL_DOLLARS)
+        tp_dollars = sl_dollars * 2
 
     elif short_score > long_score and short_score >= MIN_CONFIDENCE:
-        signal    = "SHORT"
-        score     = min(short_score, 99)
-        reasons   = short_reasons
-        sl_points = max(int((resistance - current_price) * 1000) + 30, 80)
-        tp_points = sl_points * 2
+        signal     = "SHORT"
+        score      = min(short_score, 99)
+        reasons    = short_reasons
+        sl_dollars = max(resistance - current_price, MIN_SL_DOLLARS)
+        tp_dollars = sl_dollars * 2
 
     if not signal:
         print(f"No signal. Long: {long_score} Short: {short_score} (need {MIN_CONFIDENCE}+)")
         return None
 
-    lots = calculate_lots(sl_points)
+    lots = calculate_lots(sl_dollars)
+    potential_loss = sl_dollars * 100 * GOLD_POINT_VALUE_PER_001_LOT * (lots / 0.01)
 
     return {
         "signal":     signal,
         "price":      current_price,
-        "sl_points":  sl_points,
-        "tp_points":  tp_points,
+        "sl_dollars": round(sl_dollars, 2),
+        "tp_dollars": round(tp_dollars, 2),
         "lots":       lots,
+        "potential_loss": round(potential_loss, 2),
         "confidence": score,
         "reasons":    reasons,
         "rsi":        rsi,
@@ -482,30 +488,38 @@ def send_signal(sig):
     emoji     = "📈" if sig["signal"] == "LONG" else "📉"
 
     if sig["signal"] == "LONG":
-        sl_price = sig["price"] - (sig["sl_points"] / 1000)
-        tp_price = sig["price"] + (sig["tp_points"] / 1000)
+        sl_price = sig["price"] - sig["sl_dollars"]
+        tp_price = sig["price"] + sig["tp_dollars"]
     else:
-        sl_price = sig["price"] + (sig["sl_points"] / 1000)
-        tp_price = sig["price"] - (sig["tp_points"] / 1000)
+        sl_price = sig["price"] + sig["sl_dollars"]
+        tp_price = sig["price"] - sig["tp_dollars"]
 
     reasons_text = "\n".join([f"  ✅ {r}" for r in sig["reasons"]])
     now_ist      = datetime.now(IST).strftime('%d %b %Y %H:%M IST')
 
+    mode_banner = (
+        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n"
+        "<i>Logged for review only. No trade has been placed.</i>\n\n"
+        if PAPER_MODE else
+        "⚠️ <b>LIVE SIGNAL</b>\n\n"
+    )
+
     msg = f"""
-⚔️ <b>GBPJPY SIGNAL</b> {emoji}
+{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
 ━━━━━━━━━━━━━━━━━━━━
 
 📊 <b>Direction:</b> {direction}
-💰 <b>Entry:</b> {sig["price"]:.3f} (Market Now)
-🛑 <b>Stop Loss:</b> {sl_price:.3f} ({sig["sl_points"]} pts)
-🎯 <b>Take Profit:</b> {tp_price:.3f} ({sig["tp_points"]} pts)
+💰 <b>Entry:</b> {sig["price"]:.2f} (Market Now)
+🛑 <b>Stop Loss:</b> {sl_price:.2f} (${sig["sl_dollars"]:.2f} away)
+🎯 <b>Take Profit:</b> {tp_price:.2f} (${sig["tp_dollars"]:.2f} away)
 📦 <b>Lots:</b> {sig["lots"]}
 ⚖️ <b>R:R:</b> 1:2
 🎯 <b>Confidence:</b> {sig["confidence"]}%
-💵 <b>Risk:</b> $10 (5% of $200)
+💵 <b>Max Loss If SL Hit:</b> ~${sig["potential_loss"]:.2f}
+   (Target: {RISK_PERCENT*100:.0f}% of ${CAPITAL} capital = ${RISK_AMOUNT:.2f})
 
 ━━━━━━━━━━━━━━━━━━━━
-📋 <b>WHY THIS TRADE:</b>
+📋 <b>WHY THIS SIGNAL:</b>
 {reasons_text}
 
 📈 <b>H1 Bias:</b> {sig["h1_bias"]}
@@ -513,15 +527,16 @@ def send_signal(sig):
 💧 <b>Liquidity:</b> {sig["liquidity"]}
 📊 <b>FVG:</b> {sig["fvg"]}
 📉 <b>RSI:</b> {sig["rsi"]}
-🔴 <b>Resistance:</b> {sig["resistance"]:.3f}
-🟢 <b>Support:</b> {sig["support"]:.3f}
+🔴 <b>Resistance:</b> {sig["resistance"]:.2f}
+🟢 <b>Support:</b> {sig["support"]:.2f}
 
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now_ist}
-⚠️ <i>Verify before executing. Max 3 trades/day.</i>
+⚠️ <i>Verify your broker's actual spread and contract size before
+acting on this. Gold spreads vary widely by broker. Max {MAX_TRADES_PER_DAY} signals/day.</i>
 """
     send_telegram(msg)
-    print(f"✅ Signal sent: {sig['signal']} @ {sig['price']} | Confidence: {sig['confidence']}%")
+    print(f"✅ Signal sent: {sig['signal']} @ {sig['price']} | Confidence: {sig['confidence']}% | Max loss: ${sig['potential_loss']:.2f}")
 
 # ============================================
 # SESSION LABEL
@@ -535,7 +550,7 @@ def get_session():
     elif 13 <= hour < 18:
         return "London Session 🇬🇧"
     elif 18 <= hour < 23:
-        return "New York Session 🗽"
+        return "New York Session 🗽 (best for gold)"
     else:
         return "Off Hours 🌙"
 
@@ -545,14 +560,18 @@ def get_session():
 def main():
     global trades_today, last_trade_date, last_signal_direction, last_signal_time
 
-    print("🚀 GBPJPY Bot Starting...")
+    print("🚀 XAUUSD Bot Starting...")
+    print(f"CAPITAL set to: ${CAPITAL} | Risk per trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:.0f}%)")
+    print(f"PAPER_MODE: {PAPER_MODE}")
+
     send_telegram(
-        "🚀 <b>GBPJPY Signal Bot is LIVE!</b>\n\n"
+        f"🚀 <b>XAUUSD Signal Bot is LIVE!</b>\n\n"
+        f"{'🧪 <b>PAPER MODE — signals are logged only, not executed</b>' if PAPER_MODE else '⚠️ <b>LIVE MODE</b>'}\n\n"
         "⚙️ <b>Settings:</b>\n"
-        "• Sessions: All 24/7\n"
-        "• Min Confidence: 80%+\n"
-        "• Max Trades/Day: 3\n"
-        "• Risk: $10 per trade (5%)\n"
+        f"• Capital basis: ${CAPITAL}\n"
+        f"• Risk per trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:.0f}%)\n"
+        f"• Min Confidence: {MIN_CONFIDENCE}%+\n"
+        f"• Max Signals/Day: {MAX_TRADES_PER_DAY}\n"
         "• Strategy: Structure + Liquidity + S&R + FVG + RSI\n\n"
         "Scanning every 5 minutes... ⚔️"
     )
@@ -563,67 +582,63 @@ def main():
             today     = date.today()
             session   = get_session()
 
-            # Reset daily trade counter
             if last_trade_date != today:
                 trades_today      = 0
                 last_trade_date   = today
                 last_signal_direction = None
-                print(f"\n📅 New day: {today} — Trade counter reset")
-                send_telegram(f"📅 <b>New Trading Day: {today}</b>\nTrades remaining: {MAX_TRADES_PER_DAY}")
+                print(f"\n📅 New day: {today} — Counter reset")
+                send_telegram(f"📅 <b>New Day: {today}</b>\nSignals remaining: {MAX_TRADES_PER_DAY}")
 
-            print(f"\n[{now.strftime('%H:%M')}] {session} | Trades today: {trades_today}/{MAX_TRADES_PER_DAY}")
+            print(f"\n[{now.strftime('%H:%M')}] {session} | Signals today: {trades_today}/{MAX_TRADES_PER_DAY}")
 
-            # Max trades reached
             if trades_today >= MAX_TRADES_PER_DAY:
-                print("Max trades reached for today. Sleeping 1 hour...")
+                print("Max signals reached for today. Sleeping 1 hour...")
                 time.sleep(3600)
                 continue
 
-            # Skip weekends (Sat=5, Sun=6)
+            # Gold has thin liquidity on weekends (futures roll, etc).
+            # Skipping Sat/Sun like forex as a safety default — adjust
+            # if your broker offers weekend gold CFDs you trust.
             if now.weekday() >= 5:
-                print("Weekend — market closed. Sleeping 1 hour...")
+                print("Weekend — skipping by default. Sleeping 1 hour...")
                 time.sleep(3600)
                 continue
 
-            # Fetch candles
             print("Fetching candles...")
             candles_5m = get_candles("5min", 100)
             time.sleep(2)
-            candles_1h = get_candles("1h",   100)
+            candles_1h = get_candles("1h", 100)
 
             if not candles_5m or not candles_1h:
                 print("Failed to fetch candles. Retry in 2 min...")
                 time.sleep(120)
                 continue
 
-            # Generate signal
             sig = generate_signal(candles_5m, candles_1h)
 
             if sig:
                 current_time = time.time()
                 time_since_last = current_time - last_signal_time
 
-                # Avoid same direction signal within 45 minutes
                 if (last_signal_direction == sig["signal"] and
                         time_since_last < 2700):
-                    print(f"Same direction signal within 45min. Skipping...")
+                    print("Same direction signal within 45min. Skipping...")
                 else:
                     send_signal(sig)
                     trades_today          += 1
                     last_signal_time       = current_time
                     last_signal_direction  = sig["signal"]
-                    print(f"Trades today: {trades_today}/{MAX_TRADES_PER_DAY}")
+                    print(f"Signals today: {trades_today}/{MAX_TRADES_PER_DAY}")
 
                     if trades_today >= MAX_TRADES_PER_DAY:
                         send_telegram(
-                            f"🔴 <b>Daily Trade Limit Reached!</b>\n"
-                            f"3/3 trades sent today.\n"
-                            f"Bot resumes tomorrow. Rest well. ⚔️"
+                            f"🔴 <b>Daily Signal Limit Reached!</b>\n"
+                            f"{MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY} signals sent today.\n"
+                            f"Bot resumes tomorrow."
                         )
             else:
                 print("No high confidence signal. Waiting...")
 
-            # Scan every 5 minutes
             time.sleep(300)
 
         except KeyboardInterrupt:
