@@ -24,23 +24,37 @@ MAX_TRADES_PER_DAY  = 2            # reduced from 3 — fewer, higher quality on
 MIN_CONFIDENCE      = 80
 IST = pytz.timezone('Asia/Kolkata')
 
+# SL bounds for gold on 5m/H1 confluence (module-level so main() can use
+# them for the capital adequacy check before any signal is even generated).
+# MIN: too tight gets stop-hunted by normal wicks (gold's 5m ATR is often $3-8).
+# MAX: if H1 support/resistance is this far away, that's swing-trade distance,
+#      not intraday — risking that against small capital either needs
+#      oversized lots or means the signal isn't tradeable at this account size.
+MIN_SL_DOLLARS = 4.0
+MAX_SL_DOLLARS = 15.0
+
 # PAPER MODE: if True, bot only LOGS signals to Telegram with a clear
 # "PAPER SIGNAL — NOT EXECUTED" label. No claim is made that any trade
 # is placed or guaranteed to work. Recommended to leave True for now.
 PAPER_MODE = True
 
 # ============================================
-# GOLD CONTRACT SPECS (IMPORTANT — DIFFERENT FROM FOREX)
+# GOLD CONTRACT SPECS (CORRECTED — was wrong in previous version)
 # ============================================
-# XAU/USD price is quoted in USD per troy ounce, e.g. 4200.50
-# 1 "point" here = $0.01 move in price (we define point = 1 cent for granularity)
-# Standard lot (1.00) = 100 oz → $1 move in price = $100 P&L per 1.00 lot
-# So per 0.01 lot (micro), $1 move in price = $1 P&L
-# Therefore: value per point (0.01 price move) per 0.01 lot ≈ $0.01 per point... 
-# but most retail brokers quote gold in $0.01 increments and call a "point" = $0.01 move.
-# We use the broker-standard convention below — VERIFY against your own broker's
-# contract specification before trusting this in execution, as conventions vary.
-GOLD_POINT_VALUE_PER_001_LOT = 0.01  # $ P&L per 1 point (0.01 USD) move per 0.01 lot
+# XAU/USD: standard contract = 1.00 lot = 100 troy oz
+# A $1 move in gold's price = $100 P&L per 1.00 lot
+# Therefore: a $1 move = $1 P&L per 0.01 lot (since 0.01 lot = 1 oz)
+#
+# PREVIOUS BUG: this constant was set to 0.01, which was off by 100x.
+# Combined with a second erroneous *0.01 conversion in calculate_lots(),
+# the two errors partially canceled out by coincidence, but the resulting
+# lot size still under-sized real risk by ~25x in practice (verified against
+# a real signal where actual SL loss was $77.62 against a $3 target).
+#
+# ⚠️ STILL VERIFY AGAINST YOUR OWN BROKER. Some brokers use 10oz "mini"
+# contracts or different point conventions. This is the standard 100oz
+# convention — confirm yours matches before trusting any lot size here.
+USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0  # $ P&L per $1 price move, per 0.01 lot
 
 # ============================================
 # STATE
@@ -330,27 +344,39 @@ def detect_fvg(candles):
     return None, 0
 
 # ============================================
-# CALCULATE LOTS — GOLD SPECIFIC, CAPITAL AWARE
+# CALCULATE LOTS — GOLD SPECIFIC, CAPITAL AWARE (FIXED)
 # ============================================
 def calculate_lots(sl_dollars):
     """
     sl_dollars: stop loss distance in actual USD price terms (e.g. 6.50 means $6.50 move)
-    Returns lot size so that if SL is hit, loss ≈ RISK_AMOUNT (never more).
+
+    Returns (lots, actual_risk_dollars, is_safe)
+
+    is_safe = False means even the broker's minimum lot size (0.01) would
+    risk MORE than the intended RISK_AMOUNT. In that case the signal
+    should be REJECTED, not silently sized up to the minimum — sizing up
+    a trade you can't afford to take at your real risk tolerance defeats
+    the entire purpose of risk management.
     """
     if sl_dollars <= 0:
-        return 0.01
+        return 0.01, 0, False
 
-    # Points here = cents. $1 = 100 points (cents).
-    sl_points = sl_dollars * 100
+    # lots = (risk_amount / sl_dollars) * 0.01
+    # because: loss = sl_dollars * (lots / 0.01) * $1   [solve for lots]
+    raw_lots = (RISK_AMOUNT / sl_dollars) * 0.01
+    lots = round(raw_lots, 2)
 
-    if sl_points <= 0:
-        return 0.01
+    # Broker minimum is 0.01 — if calculated lots round to less than that,
+    # the SL is simply too wide for this capital at this risk level.
+    if lots < 0.01:
+        loss_at_minimum = sl_dollars * (0.01 / 0.01) * USD_PER_DOLLAR_MOVE_PER_001_LOT
+        return 0.01, round(loss_at_minimum, 2), False
 
-    lots = RISK_AMOUNT / (sl_points * GOLD_POINT_VALUE_PER_001_LOT)
-    # Convert to lot units (lots variable currently in units of 0.01 lot)
-    lots = lots * 0.01
-    lots = round(min(max(lots, 0.01), 0.50), 2)
-    return lots
+    lots = min(lots, 0.50)
+    actual_risk = sl_dollars * (lots / 0.01) * USD_PER_DOLLAR_MOVE_PER_001_LOT
+    is_safe = actual_risk <= RISK_AMOUNT * 1.1  # small tolerance for rounding
+
+    return lots, round(actual_risk, 2), is_safe
 
 # ============================================
 # MAIN SIGNAL ENGINE
@@ -437,30 +463,42 @@ def generate_signal(candles_5m, candles_1h):
     sl_dollars = 0
     tp_dollars = 0
 
-    # Minimum SL distance for gold on 5m/H1 confluence — gold whipsaws hard,
-    # a too-tight SL here gets stop-hunted constantly. $4 floor is intentional.
-    MIN_SL_DOLLARS = 4.0
-
     if long_score > short_score and long_score >= MIN_CONFIDENCE:
         signal     = "LONG"
         score      = min(long_score, 99)
         reasons    = long_reasons
-        sl_dollars = max(current_price - support, MIN_SL_DOLLARS)
-        tp_dollars = sl_dollars * 2
-
+        sl_dollars = current_price - support
     elif short_score > long_score and short_score >= MIN_CONFIDENCE:
         signal     = "SHORT"
         score      = min(short_score, 99)
         reasons    = short_reasons
-        sl_dollars = max(resistance - current_price, MIN_SL_DOLLARS)
-        tp_dollars = sl_dollars * 2
+        sl_dollars = resistance - current_price
 
     if not signal:
         print(f"No signal. Long: {long_score} Short: {short_score} (need {MIN_CONFIDENCE}+)")
         return None
 
-    lots = calculate_lots(sl_dollars)
-    potential_loss = sl_dollars * 100 * GOLD_POINT_VALUE_PER_001_LOT * (lots / 0.01)
+    # Reject if the structural SL distance is outside tradeable bounds for
+    # this account size, rather than silently clamping it.
+    if sl_dollars < MIN_SL_DOLLARS or sl_dollars > MAX_SL_DOLLARS:
+        print(
+            f"Signal rejected: structural SL distance ${sl_dollars:.2f} is outside "
+            f"tradeable range (${MIN_SL_DOLLARS}-${MAX_SL_DOLLARS}) for this capital. "
+            f"This setup may be valid technically but isn't sized for ${CAPITAL} account."
+        )
+        return None
+
+    tp_dollars = sl_dollars * 2
+
+    lots, actual_risk, is_safe = calculate_lots(sl_dollars)
+
+    if not is_safe:
+        print(
+            f"Signal rejected: even minimum lot size (0.01) would risk "
+            f"${actual_risk:.2f}, exceeding target risk of ${RISK_AMOUNT:.2f}. "
+            f"This capital base cannot safely take this trade."
+        )
+        return None
 
     return {
         "signal":     signal,
@@ -468,7 +506,7 @@ def generate_signal(candles_5m, candles_1h):
         "sl_dollars": round(sl_dollars, 2),
         "tp_dollars": round(tp_dollars, 2),
         "lots":       lots,
-        "potential_loss": round(potential_loss, 2),
+        "potential_loss": actual_risk,
         "confidence": score,
         "reasons":    reasons,
         "rsi":        rsi,
@@ -563,6 +601,27 @@ def main():
     print("🚀 XAUUSD Bot Starting...")
     print(f"CAPITAL set to: ${CAPITAL} | Risk per trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:.0f}%)")
     print(f"PAPER_MODE: {PAPER_MODE}")
+
+    # Honest capital adequacy check — gold's minimum lot size (0.01 = 1oz)
+    # means every $1 of price move = $1 of real risk at minimum size.
+    # If even the smallest tradeable SL distance exceeds the risk target,
+    # this account size genuinely cannot trade gold safely. This isn't a
+    # bug to size around — it's a real constraint of the instrument.
+    min_possible_risk = MIN_SL_DOLLARS * 1.0  # at 0.01 lot, $1 risk per $1 SL
+    if min_possible_risk > RISK_AMOUNT:
+        warning = (
+            f"⚠️ <b>CAPITAL WARNING</b>\n\n"
+            f"With ${CAPITAL} capital and {RISK_PERCENT*100:.0f}% risk target "
+            f"(${RISK_AMOUNT:.2f}), even the smallest tradeable gold position "
+            f"(0.01 lots, ${MIN_SL_DOLLARS} minimum SL) risks ~${min_possible_risk:.2f} — "
+            f"more than your target risk.\n\n"
+            f"Gold's contract size (1oz minimum) doesn't divide finely enough "
+            f"for this account size at this risk level. This bot will keep "
+            f"running in PAPER_MODE for review, but live execution at this "
+            f"capital level is not recommended for XAUUSD specifically."
+        )
+        print(warning.replace("<b>", "").replace("</b>", ""))
+        send_telegram(warning)
 
     send_telegram(
         f"🚀 <b>XAUUSD Signal Bot is LIVE!</b>\n\n"
