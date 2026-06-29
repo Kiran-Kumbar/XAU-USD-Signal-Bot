@@ -24,12 +24,15 @@ MAX_TRADES_PER_DAY  = 2            # reduced from 3 — fewer, higher quality on
 MIN_CONFIDENCE      = 80
 IST = pytz.timezone('Asia/Kolkata')
 
-# SL bounds for gold on 5m/H1 confluence (module-level so main() can use
+# SL bounds for gold on 5m/15m confluence (module-level so main() can use
 # them for the capital adequacy check before any signal is even generated).
 # MIN: too tight gets stop-hunted by normal wicks (gold's 5m ATR is often $3-8).
-# MAX: if H1 support/resistance is this far away, that's swing-trade distance,
-#      not intraday — risking that against small capital either needs
-#      oversized lots or means the signal isn't tradeable at this account size.
+# MAX: 15M-derived support/resistance naturally sits closer to current price
+#      than H1-derived levels did (shorter lookback window = less price travel),
+#      so these bounds are left unchanged on purpose — they should now reject
+#      fewer signals than they did under the old 5M+H1 setup, not more.
+#      Watch your paper signal logs to see how often this ceiling is actually
+#      hit now versus before.
 MIN_SL_DOLLARS = 4.0
 MAX_SL_DOLLARS = 15.0
 
@@ -234,12 +237,12 @@ def detect_liquidity_grab(candles):
 # ============================================
 # SUPPORT & RESISTANCE (KEY LEVELS)
 # ============================================
-def get_sr_levels(candles_1h, candles_5m):
-    h1_highs = sorted([c["high"] for c in candles_1h[-30:]], reverse=True)
-    h1_lows  = sorted([c["low"]  for c in candles_1h[-30:]])
+def get_sr_levels(candles_15m, candles_5m):
+    tf_highs = sorted([c["high"] for c in candles_15m[-30:]], reverse=True)
+    tf_lows  = sorted([c["low"]  for c in candles_15m[-30:]])
 
-    resistance = h1_highs[2] if len(h1_highs) > 2 else h1_highs[0]
-    support    = h1_lows[2]  if len(h1_lows)  > 2 else h1_lows[0]
+    resistance = tf_highs[2] if len(tf_highs) > 2 else tf_highs[0]
+    support    = tf_lows[2]  if len(tf_lows)  > 2 else tf_lows[0]
 
     current = candles_5m[-1]["close"]
 
@@ -381,23 +384,23 @@ def calculate_lots(sl_dollars):
 # ============================================
 # MAIN SIGNAL ENGINE
 # ============================================
-def generate_signal(candles_5m, candles_1h):
-    if not candles_5m or not candles_1h:
+def generate_signal(candles_5m, candles_15m):
+    if not candles_5m or not candles_15m:
         return None
 
     current_price = candles_5m[-1]["close"]
 
-    h1_structure, h1_score  = analyze_structure(candles_1h)
+    tf_structure, tf_score  = analyze_structure(candles_15m)
     m5_structure, m5_score  = analyze_structure(candles_5m)
     liquidity, liq_score    = detect_liquidity_grab(candles_5m)
     pattern,  pat_score     = check_candle_pattern(candles_5m)
     fvg,      fvg_score     = detect_fvg(candles_5m)
-    support, resistance, near_support, near_resistance = get_sr_levels(candles_1h, candles_5m)
+    support, resistance, near_support, near_resistance = get_sr_levels(candles_15m, candles_5m)
     rsi = calculate_rsi(candles_5m)
 
     print(f"\n--- ANALYSIS ---")
     print(f"Price: {current_price:.2f}")
-    print(f"H1 Structure: {h1_structure} (score {h1_score})")
+    print(f"15M Structure: {tf_structure} (score {tf_score})")
     print(f"M5 Structure: {m5_structure} (score {m5_score})")
     print(f"Liquidity: {liquidity}")
     print(f"Pattern: {pattern}")
@@ -405,12 +408,18 @@ def generate_signal(candles_5m, candles_1h):
     print(f"RSI: {rsi}")
     print(f"Support: {support:.2f} | Resistance: {resistance:.2f}")
 
+    # NOTE: weight (30) was originally calibrated for H1 vs 5M (12x timeframe
+    # ratio). With 15M vs 5M (only 3x ratio), the higher-TF structure carries
+    # less inherent reliability advantage over 5M noise than it did with H1.
+    # Keeping the same weight as requested for now — but be aware this means
+    # the "15M Structure" signal may behave more like a second 5M opinion
+    # than a true higher-timeframe confirmation. Worth watching in your testing.
     long_score = 0
     long_reasons = []
 
-    if h1_structure == "BULLISH":
+    if tf_structure == "BULLISH":
         long_score += 30
-        long_reasons.append("H1 Bullish Structure")
+        long_reasons.append("15M Bullish Structure")
     if m5_structure == "BULLISH":
         long_score += 15
         long_reasons.append("M5 Bullish Structure")
@@ -433,9 +442,9 @@ def generate_signal(candles_5m, candles_1h):
     short_score = 0
     short_reasons = []
 
-    if h1_structure == "BEARISH":
+    if tf_structure == "BEARISH":
         short_score += 30
-        short_reasons.append("H1 Bearish Structure")
+        short_reasons.append("15M Bearish Structure")
     if m5_structure == "BEARISH":
         short_score += 15
         short_reasons.append("M5 Bearish Structure")
@@ -512,7 +521,7 @@ def generate_signal(candles_5m, candles_1h):
         "rsi":        rsi,
         "support":    support,
         "resistance": resistance,
-        "h1_bias":    h1_structure,
+        "tf_bias":    tf_structure,
         "pattern":    pattern or "None",
         "liquidity":  liquidity or "None",
         "fvg":        fvg or "None"
@@ -560,7 +569,7 @@ def send_signal(sig):
 📋 <b>WHY THIS SIGNAL:</b>
 {reasons_text}
 
-📈 <b>H1 Bias:</b> {sig["h1_bias"]}
+📈 <b>15M Bias:</b> {sig["tf_bias"]}
 🕯 <b>Pattern:</b> {sig["pattern"]}
 💧 <b>Liquidity:</b> {sig["liquidity"]}
 📊 <b>FVG:</b> {sig["fvg"]}
@@ -666,14 +675,14 @@ def main():
             print("Fetching candles...")
             candles_5m = get_candles("5min", 100)
             time.sleep(2)
-            candles_1h = get_candles("1h", 100)
+            candles_15m = get_candles("15min", 100)
 
-            if not candles_5m or not candles_1h:
+            if not candles_5m or not candles_15m:
                 print("Failed to fetch candles. Retry in 2 min...")
                 time.sleep(120)
                 continue
 
-            sig = generate_signal(candles_5m, candles_1h)
+            sig = generate_signal(candles_5m, candles_15m)
 
             if sig:
                 current_time = time.time()
@@ -698,7 +707,14 @@ def main():
             else:
                 print("No high confidence signal. Waiting...")
 
-            time.sleep(300)
+            # Calculate exactly how many seconds remain until the next 5-minute clock boundary (:00, :05, :10)
+            current_timestamp = time.time()
+            seconds_until_next_candle = 300 - (current_timestamp % 300)
+            
+            # Sleep until the candle closes, PLUS 3 seconds to let Twelvedata update their API
+            sleep_time = seconds_until_next_candle + 3
+            print(f"Waiting {int(sleep_time)}s for the next candle to close...")
+            time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             print("Bot stopped manually.")
