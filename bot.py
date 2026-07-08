@@ -1,3 +1,4 @@
+import os
 import requests
 import time
 from datetime import datetime, date
@@ -6,80 +7,45 @@ import pytz
 # ============================================
 # CONFIGURATION
 # ============================================
-import os
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 
-TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID")
-TWELVEDATA_API_KEY  = os.environ.get("TWELVEDATA_API_KEY")
+SYMBOL       = "XAU/USD"
+CAPITAL      = 200
+RISK_PERCENT = 0.05
+RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $10
 
-SYMBOL = "XAU/USD"
+MAX_TRADES_PER_DAY = 3
+MIN_CONFIDENCE     = 65
+MIN_SL_DOLLARS     = 3.0
+MAX_SL_DOLLARS     = 20.0
+MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
+EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
+IST                = pytz.timezone('Asia/Kolkata')
 
-# ⚠️ SET THIS TO YOUR ACTUAL CURRENT BALANCE — NOT YOUR ORIGINAL CAPITAL.
-# Risk sizing is meaningless if this number is wrong.
-CAPITAL = 100  # <-- CHANGE THIS to your real current balance before running
-
-RISK_PERCENT       = 0.03          # 3% per trade (reduced from 5% given drawdown)
-RISK_AMOUNT        = CAPITAL * RISK_PERCENT
-MAX_TRADES_PER_DAY  = 2            # reduced from 3 — fewer, higher quality only
-MIN_CONFIDENCE      = 80
-IST = pytz.timezone('Asia/Kolkata')
-
-# SL bounds for gold on 5m/15m confluence (module-level so main() can use
-# them for the capital adequacy check before any signal is even generated).
-# MIN: too tight gets stop-hunted by normal wicks (gold's 5m ATR is often $3-8).
-# MAX: 15M-derived support/resistance naturally sits closer to current price
-#      than H1-derived levels did (shorter lookback window = less price travel),
-#      so these bounds are left unchanged on purpose — they should now reject
-#      fewer signals than they did under the old 5M+H1 setup, not more.
-#      Watch your paper signal logs to see how often this ceiling is actually
-#      hit now versus before.
-MIN_SL_DOLLARS = 4.0
-MAX_SL_DOLLARS = 15.0
-
-# PAPER MODE: if True, bot only LOGS signals to Telegram with a clear
-# "PAPER SIGNAL — NOT EXECUTED" label. No claim is made that any trade
-# is placed or guaranteed to work. Recommended to leave True for now.
 PAPER_MODE = True
 
-# ============================================
-# GOLD CONTRACT SPECS (CORRECTED — was wrong in previous version)
-# ============================================
-# XAU/USD: standard contract = 1.00 lot = 100 troy oz
-# A $1 move in gold's price = $100 P&L per 1.00 lot
-# Therefore: a $1 move = $1 P&L per 0.01 lot (since 0.01 lot = 1 oz)
-#
-# PREVIOUS BUG: this constant was set to 0.01, which was off by 100x.
-# Combined with a second erroneous *0.01 conversion in calculate_lots(),
-# the two errors partially canceled out by coincidence, but the resulting
-# lot size still under-sized real risk by ~25x in practice (verified against
-# a real signal where actual SL loss was $77.62 against a $3 target).
-#
-# ⚠️ STILL VERIFY AGAINST YOUR OWN BROKER. Some brokers use 10oz "mini"
-# contracts or different point conventions. This is the standard 100oz
-# convention — confirm yours matches before trusting any lot size here.
-USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0  # $ P&L per $1 price move, per 0.01 lot
+# Gold contract: 1.00 lot = 100oz → $1 move = $100/lot → $1 move = $1 per 0.01 lot
+USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0
 
 # ============================================
 # STATE
 # ============================================
-trades_today = 0
-last_trade_date = None
+trades_today          = 0
+last_trade_date       = None
 last_signal_direction = None
-last_signal_time = 0
+last_signal_time      = 0
 
 # ============================================
 # TELEGRAM
 # ============================================
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram sent: {r.status_code}")
+        print(f"Telegram: {r.status_code}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -87,16 +53,13 @@ def send_telegram(message):
 # FETCH CANDLES
 # ============================================
 def get_candles(interval="5min", outputsize=100):
-    url = "https://api.twelvedata.com/time_series"
+    url    = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": SYMBOL,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
+        "symbol": SYMBOL, "interval": interval,
+        "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY, "format": "JSON"
     }
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r    = requests.get(url, params=params, timeout=15)
         data = r.json()
         if "values" not in data:
             print(f"API Error: {data}")
@@ -104,10 +67,8 @@ def get_candles(interval="5min", outputsize=100):
         candles = []
         for c in reversed(data["values"]):
             candles.append({
-                "time": c["datetime"],
-                "open":  float(c["open"]),
-                "high":  float(c["high"]),
-                "low":   float(c["low"]),
+                "time": c["datetime"], "open": float(c["open"]),
+                "high": float(c["high"]), "low": float(c["low"]),
                 "close": float(c["close"])
             })
         return candles
@@ -118,92 +79,219 @@ def get_candles(interval="5min", outputsize=100):
 # ============================================
 # SWING HIGH / LOW DETECTION
 # ============================================
-def find_swing_highs(candles, lookback=5):
+def find_swing_highs(candles, lookback=3):
     swings = []
     for i in range(lookback, len(candles) - lookback):
-        is_swing = all(
-            candles[i]["high"] >= candles[i-j]["high"] and
-            candles[i]["high"] >= candles[i+j]["high"]
-            for j in range(1, lookback+1)
-        )
-        if is_swing:
+        if all(candles[i]["high"] >= candles[i-j]["high"] and
+               candles[i]["high"] >= candles[i+j]["high"]
+               for j in range(1, lookback+1)):
             swings.append((i, candles[i]["high"]))
     return swings
 
-def find_swing_lows(candles, lookback=5):
+def find_swing_lows(candles, lookback=3):
     swings = []
     for i in range(lookback, len(candles) - lookback):
-        is_swing = all(
-            candles[i]["low"] <= candles[i-j]["low"] and
-            candles[i]["low"] <= candles[i+j]["low"]
-            for j in range(1, lookback+1)
-        )
-        if is_swing:
+        if all(candles[i]["low"] <= candles[i-j]["low"] and
+               candles[i]["low"] <= candles[i+j]["low"]
+               for j in range(1, lookback+1)):
             swings.append((i, candles[i]["low"]))
     return swings
 
 # ============================================
-# MARKET STRUCTURE (BOS / CHoCH)
+# MARKET STRUCTURE — BOS & CHoCH
 # ============================================
-def analyze_structure(candles):
-    if len(candles) < 30:
-        return "NEUTRAL", 0
+def analyze_structure_bos(candles):
+    """
+    Returns (bias, bos_type, choch)
+    bias    = "BULLISH" | "BEARISH" | "NEUTRAL"
+    bos_type = "BOS" | "CHoCH" | None
+    """
+    if len(candles) < 20:
+        return "NEUTRAL", None, False
 
-    swing_highs = find_swing_highs(candles[-50:], lookback=3)
-    swing_lows  = find_swing_lows(candles[-50:],  lookback=3)
+    swing_highs = find_swing_highs(candles[-60:], lookback=3)
+    swing_lows  = find_swing_lows(candles[-60:],  lookback=3)
 
     if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "NEUTRAL", 0
+        return "NEUTRAL", None, False
 
-    sh1, sh2 = swing_highs[-2][1], swing_highs[-1][1]
-    sl1, sl2 = swing_lows[-2][1],  swing_lows[-1][1]
+    curr_price = candles[-1]["close"]
+    last_sh    = swing_highs[-1][1]
+    last_sl    = swing_lows[-1][1]
+    prev_sh    = swing_highs[-2][1]
+    prev_sl    = swing_lows[-2][1]
 
-    bullish_score = 0
-    bearish_score = 0
-
-    if sh2 > sh1:
-        bullish_score += 1
-    else:
-        bearish_score += 1
-
-    if sl2 > sl1:
-        bullish_score += 1
-    else:
-        bearish_score += 1
-
-    recent_closes = [c["close"] for c in candles[-5:]]
-    if recent_closes[-1] > recent_closes[0]:
-        bullish_score += 1
-    else:
-        bearish_score += 1
-
-    closes = [c["close"] for c in candles]
+    # EMA trend bias
+    closes   = [c["close"] for c in candles]
     ema_fast = sum(closes[-10:]) / 10
     ema_slow = sum(closes[-30:]) / 30
+    ema_bias = "BULLISH" if ema_fast > ema_slow else "BEARISH"
 
-    if ema_fast > ema_slow:
-        bullish_score += 1
-    else:
-        bearish_score += 1
+    # BOS: price breaks above last swing high = bullish BOS
+    #      price breaks below last swing low  = bearish BOS
+    bullish_bos = curr_price > last_sh
+    bearish_bos = curr_price < last_sl
 
-    if bullish_score >= 3:
-        return "BULLISH", bullish_score
-    elif bearish_score >= 3:
-        return "BEARISH", bearish_score
+    # CHoCH: structural reversal
+    # Bullish CHoCH: was bearish trend (lower highs), now breaks above last swing high
+    was_bearish  = last_sh < prev_sh and last_sl < prev_sl
+    was_bullish  = last_sh > prev_sh and last_sl > prev_sl
+    bullish_choch = was_bearish and bullish_bos
+    bearish_choch = was_bullish and bearish_bos
+
+    if bullish_choch:
+        return "BULLISH", "CHoCH", True
+    elif bearish_choch:
+        return "BEARISH", "CHoCH", True
+    elif bullish_bos and ema_bias == "BULLISH" and last_sh > prev_sh:
+        return "BULLISH", "BOS", False
+    elif bearish_bos and ema_bias == "BEARISH" and last_sl < prev_sl:
+        return "BEARISH", "BOS", False
+    elif ema_bias == "BULLISH" and last_sh > prev_sh and last_sl > prev_sl:
+        return "BULLISH", None, False
+    elif ema_bias == "BEARISH" and last_sh < prev_sh and last_sl < prev_sl:
+        return "BEARISH", None, False
     else:
-        return "NEUTRAL", 0
+        return "NEUTRAL", None, False
 
 # ============================================
-# LIQUIDITY GRAB DETECTION
+# ORDER BLOCK DETECTION
+# ============================================
+def detect_order_block(candles, bias):
+    """
+    Bullish OB: last bearish (red) candle before a strong bullish impulse
+    Bearish OB: last bullish (green) candle before a strong bearish impulse
+    Returns (ob_high, ob_low, price_in_ob) or (None, None, False)
+    """
+    if len(candles) < 10:
+        return None, None, False
+
+    curr_price = candles[-1]["close"]
+
+    if bias == "BULLISH":
+        # Find last bearish candle followed by bullish impulse
+        for i in range(len(candles)-3, max(len(candles)-20, 3), -1):
+            c = candles[i]
+            # Bearish candle
+            if c["close"] < c["open"]:
+                # Check if next 2 candles moved up strongly (impulse)
+                next_closes = [candles[i+j]["close"] for j in range(1, 3) if i+j < len(candles)]
+                if next_closes and max(next_closes) > c["high"]:
+                    ob_high = c["high"]
+                    ob_low  = c["low"]
+                    price_in_ob = ob_low <= curr_price <= ob_high
+                    return ob_high, ob_low, price_in_ob
+
+    elif bias == "BEARISH":
+        # Find last bullish candle followed by bearish impulse
+        for i in range(len(candles)-3, max(len(candles)-20, 3), -1):
+            c = candles[i]
+            # Bullish candle
+            if c["close"] > c["open"]:
+                # Check if next 2 candles moved down strongly (impulse)
+                next_closes = [candles[i+j]["close"] for j in range(1, 3) if i+j < len(candles)]
+                if next_closes and min(next_closes) < c["low"]:
+                    ob_high = c["high"]
+                    ob_low  = c["low"]
+                    price_in_ob = ob_low <= curr_price <= ob_high
+                    return ob_high, ob_low, price_in_ob
+
+    return None, None, False
+
+# ============================================
+# EQUAL HIGHS / EQUAL LOWS (LIQUIDITY ZONES)
+# ============================================
+def detect_liquidity_zones(candles):
+    """
+    Equal highs = buy-side liquidity (stops sitting above)
+    Equal lows  = sell-side liquidity (stops sitting below)
+    Returns (equal_highs, equal_lows, swept_high, swept_low)
+    """
+    if len(candles) < 10:
+        return False, False, False, False
+
+    recent      = candles[-30:]
+    curr_price  = candles[-1]["close"]
+    highs       = [c["high"] for c in recent[:-2]]
+    lows        = [c["low"]  for c in recent[:-2]]
+    last_high   = candles[-1]["high"]
+    last_low    = candles[-1]["low"]
+
+    # Find equal highs (within tolerance)
+    equal_highs = False
+    swept_high  = False
+    for i in range(len(highs)):
+        for j in range(i+1, len(highs)):
+            if abs(highs[i] - highs[j]) <= EQUAL_LEVEL_TOL:
+                equal_highs = True
+                # Swept = current candle wick went above those equal highs
+                if last_high > max(highs[i], highs[j]):
+                    swept_high = True
+
+    # Find equal lows (within tolerance)
+    equal_lows = False
+    swept_low  = False
+    for i in range(len(lows)):
+        for j in range(i+1, len(lows)):
+            if abs(lows[i] - lows[j]) <= EQUAL_LEVEL_TOL:
+                equal_lows = True
+                if last_low < min(lows[i], lows[j]):
+                    swept_low = True
+
+    return equal_highs, equal_lows, swept_high, swept_low
+
+# ============================================
+# IMPROVED FVG WITH SIZE FILTER
+# ============================================
+def detect_fvg(candles):
+    """
+    Checks last 10 candle triplets for any unfilled FVG
+    with minimum size filter to remove noise.
+    """
+    if len(candles) < 3:
+        return None, 0
+
+    # Check multiple recent candle triplets, not just the last 3
+    for i in range(len(candles)-3, max(len(candles)-10, 0), -1):
+        c1 = candles[i]
+        c2 = candles[i+1]
+        c3 = candles[i+2]
+
+        # Bullish FVG: gap between c1 high and c3 low
+        if c1["high"] < c3["low"]:
+            gap_size = c3["low"] - c1["high"]
+            if gap_size >= MIN_FVG_SIZE:
+                # Check if still unfilled (current price hasn't gone back into gap)
+                curr = candles[-1]["close"]
+                if curr > c1["high"]:  # price still above the gap
+                    return "BULLISH_FVG", 1
+
+        # Bearish FVG: gap between c1 low and c3 high
+        if c1["low"] > c3["high"]:
+            gap_size = c1["low"] - c3["high"]
+            if gap_size >= MIN_FVG_SIZE:
+                curr = candles[-1]["close"]
+                if curr < c1["low"]:  # price still below the gap
+                    return "BEARISH_FVG", 1
+
+    return None, 0
+
+# ============================================
+# IMPROVED LIQUIDITY GRAB
 # ============================================
 def detect_liquidity_grab(candles):
+    """
+    Spike above recent high then close back below = bearish grab
+    Spike below recent low then close back above  = bullish grab
+    Uses dollar-based wick size instead of body ratio
+    to handle doji candles correctly.
+    """
     if len(candles) < 10:
         return None, 0
 
-    recent = candles[-10:]
-    prev   = candles[-2]
-    curr   = candles[-1]
-
+    recent       = candles[-10:]
+    prev         = candles[-2]
+    curr         = candles[-1]
     recent_highs = [c["high"] for c in recent[:-2]]
     recent_lows  = [c["low"]  for c in recent[:-2]]
 
@@ -212,22 +300,21 @@ def detect_liquidity_grab(candles):
 
     max_high = max(recent_highs)
     min_low  = min(recent_lows)
+    grab     = None
+    score    = 0
 
-    score = 0
-    grab  = None
-
+    # Bearish grab: wick above recent high, closed back below
     if prev["high"] > max_high:
         wick_size = prev["high"] - max(prev["open"], prev["close"])
-        body_size = abs(prev["open"] - prev["close"])
-        if wick_size > body_size * 1.5:
+        if wick_size >= 1.0:  # minimum $1 wick to count
             if curr["close"] < curr["open"]:
                 grab  = "BEARISH_GRAB"
                 score = 2
 
+    # Bullish grab: wick below recent low, closed back above
     if prev["low"] < min_low:
         wick_size = min(prev["open"], prev["close"]) - prev["low"]
-        body_size = abs(prev["open"] - prev["close"])
-        if wick_size > body_size * 1.5:
+        if wick_size >= 1.0:  # minimum $1 wick to count
             if curr["close"] > curr["open"]:
                 grab  = "BULLISH_GRAB"
                 score = 2
@@ -235,68 +322,31 @@ def detect_liquidity_grab(candles):
     return grab, score
 
 # ============================================
-# SUPPORT & RESISTANCE (KEY LEVELS)
-# ============================================
-def get_sr_levels(candles_15m, candles_5m):
-    tf_highs = sorted([c["high"] for c in candles_15m[-30:]], reverse=True)
-    tf_lows  = sorted([c["low"]  for c in candles_15m[-30:]])
-
-    resistance = tf_highs[2] if len(tf_highs) > 2 else tf_highs[0]
-    support    = tf_lows[2]  if len(tf_lows)  > 2 else tf_lows[0]
-
-    current = candles_5m[-1]["close"]
-
-    # Gold moves in dollars, not the same scale as GBPJPY.
-    # Distance expressed in actual $ price difference (not x1000).
-    dist_resistance = abs(resistance - current)
-    dist_support    = abs(current - support)
-
-    # "Near" threshold for gold = $8 (tunable). Gold's average true range
-    # on 5m is typically $3-8, so this keeps it comparable in spirit
-    # to the 50-point GBPJPY threshold, scaled to gold's actual volatility.
-    near_resistance = dist_resistance < 8
-    near_support    = dist_support    < 8
-
-    return support, resistance, near_support, near_resistance
-
-# ============================================
-# CANDLESTICK PATTERN (REJECTION)
+# CANDLESTICK PATTERN
 # ============================================
 def check_candle_pattern(candles):
-    if len(candles) < 3:
+    if len(candles) < 2:
         return None, 0
 
     c2 = candles[-2]
     c3 = candles[-1]
 
-    score = 0
-    pattern = None
-
-    if (c2["open"] < c2["close"] and
-        c3["open"] > c3["close"] and
-        c3["open"] >= c2["close"] and
-        c3["close"] <= c2["open"]):
-        pattern = "BEARISH_ENGULF"
-        score   = 2
-
-    elif (c2["open"] > c2["close"] and
-          c3["open"] < c3["close"] and
-          c3["open"] <= c2["close"] and
-          c3["close"] >= c2["open"]):
-        pattern = "BULLISH_ENGULF"
-        score   = 2
-
+    if (c2["open"] < c2["close"] and c3["open"] > c3["close"] and
+            c3["open"] >= c2["close"] and c3["close"] <= c2["open"]):
+        return "BEARISH_ENGULF", 2
+    elif (c2["open"] > c2["close"] and c3["open"] < c3["close"] and
+            c3["open"] <= c2["close"] and c3["close"] >= c2["open"]):
+        return "BULLISH_ENGULF", 2
     elif (c3["high"] - max(c3["open"], c3["close"]) >
-          2 * abs(c3["open"] - c3["close"])):
-        pattern = "SHOOTING_STAR"
-        score   = 1
-
+            2 * abs(c3["open"] - c3["close"]) and
+            abs(c3["open"] - c3["close"]) > 0):
+        return "SHOOTING_STAR", 1
     elif (min(c3["open"], c3["close"]) - c3["low"] >
-          2 * abs(c3["open"] - c3["close"])):
-        pattern = "HAMMER"
-        score   = 1
+            2 * abs(c3["open"] - c3["close"]) and
+            abs(c3["open"] - c3["close"]) > 0):
+        return "HAMMER", 1
 
-    return pattern, score
+    return None, 0
 
 # ============================================
 # RSI
@@ -304,227 +354,232 @@ def check_candle_pattern(candles):
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
         return 50
-
-    closes = [c["close"] for c in candles[-(period+1):]]
-    gains  = []
-    losses = []
-
+    closes   = [c["close"] for c in candles[-(period+1):]]
+    gains, losses = [], []
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    if avg_loss == 0:
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains) / period
+    avg_l = sum(losses) / period
+    if avg_l == 0:
         return 100
-
-    rs  = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    return round(100 - (100 / (1 + avg_g / avg_l)), 2)
 
 # ============================================
-# FAIR VALUE GAP (FVG)
+# SMART SL PLACEMENT
 # ============================================
-def detect_fvg(candles):
-    if len(candles) < 3:
-        return None, 0
+def calculate_sl_distance(candles, bias, ob_high, ob_low):
+    """
+    LONG: SL below order block low, or below last swing low
+    SHORT: SL above order block high, or above last swing high
+    Returns sl_dollars (distance from current price)
+    """
+    curr = candles[-1]["close"]
 
-    c1 = candles[-3]
-    c3 = candles[-1]
+    if bias == "LONG":
+        if ob_low is not None:
+            sl_level = ob_low - 0.50   # just below OB low
+        else:
+            swing_lows = find_swing_lows(candles[-30:])
+            sl_level = swing_lows[-1][1] - 0.50 if swing_lows else curr - 8.0
+        return max(curr - sl_level, MIN_SL_DOLLARS)
 
-    if c1["high"] < c3["low"]:
-        return "BULLISH_FVG", 1
+    elif bias == "SHORT":
+        if ob_high is not None:
+            sl_level = ob_high + 0.50  # just above OB high
+        else:
+            swing_highs = find_swing_highs(candles[-30:])
+            sl_level = swing_highs[-1][1] + 0.50 if swing_highs else curr + 8.0
+        return max(sl_level - curr, MIN_SL_DOLLARS)
 
-    if c1["low"] > c3["high"]:
-        return "BEARISH_FVG", 1
-
-    return None, 0
+    return 8.0
 
 # ============================================
-# CALCULATE LOTS — GOLD SPECIFIC, CAPITAL AWARE (FIXED)
+# CALCULATE LOTS
 # ============================================
 def calculate_lots(sl_dollars):
-    """
-    sl_dollars: stop loss distance in actual USD price terms (e.g. 6.50 means $6.50 move)
-
-    Returns (lots, actual_risk_dollars, is_safe)
-
-    is_safe = False means even the broker's minimum lot size (0.01) would
-    risk MORE than the intended RISK_AMOUNT. In that case the signal
-    should be REJECTED, not silently sized up to the minimum — sizing up
-    a trade you can't afford to take at your real risk tolerance defeats
-    the entire purpose of risk management.
-    """
     if sl_dollars <= 0:
         return 0.01, 0, False
-
-    # lots = (risk_amount / sl_dollars) * 0.01
-    # because: loss = sl_dollars * (lots / 0.01) * $1   [solve for lots]
     raw_lots = (RISK_AMOUNT / sl_dollars) * 0.01
-    lots = round(raw_lots, 2)
-
-    # Broker minimum is 0.01 — if calculated lots round to less than that,
-    # the SL is simply too wide for this capital at this risk level.
+    lots     = round(raw_lots, 2)
     if lots < 0.01:
-        loss_at_minimum = sl_dollars * (0.01 / 0.01) * USD_PER_DOLLAR_MOVE_PER_001_LOT
-        return 0.01, round(loss_at_minimum, 2), False
-
-    lots = min(lots, 0.50)
+        return 0.01, round(sl_dollars * 1.0, 2), False
+    lots        = min(lots, 0.50)
     actual_risk = sl_dollars * (lots / 0.01) * USD_PER_DOLLAR_MOVE_PER_001_LOT
-    is_safe = actual_risk <= RISK_AMOUNT * 1.1  # small tolerance for rounding
-
+    is_safe     = actual_risk <= RISK_AMOUNT * 2.0
     return lots, round(actual_risk, 2), is_safe
 
 # ============================================
-# MAIN SIGNAL ENGINE
+# MAIN SIGNAL ENGINE — FULL SMC STRATEGY
 # ============================================
 def generate_signal(candles_5m, candles_15m):
     if not candles_5m or not candles_15m:
         return None
 
-    current_price = candles_5m[-1]["close"]
+    curr_price = candles_5m[-1]["close"]
 
-    tf_structure, tf_score  = analyze_structure(candles_15m)
-    m5_structure, m5_score  = analyze_structure(candles_5m)
-    liquidity, liq_score    = detect_liquidity_grab(candles_5m)
-    pattern,  pat_score     = check_candle_pattern(candles_5m)
-    fvg,      fvg_score     = detect_fvg(candles_5m)
-    support, resistance, near_support, near_resistance = get_sr_levels(candles_15m, candles_5m)
-    rsi = calculate_rsi(candles_5m)
+    # --- 15M HIGHER TIMEFRAME BIAS (non-negotiable gate) ---
+    tf_bias, bos_type, choch = analyze_structure_bos(candles_15m)
+
+    # GATE: if 15M is NEUTRAL, no trade — no higher-TF confirmation
+    if tf_bias == "NEUTRAL":
+        print(f"Price: {curr_price:.2f} | 15M = NEUTRAL — no trade")
+        return None
+
+    # --- 5M ANALYSIS ---
+    m5_bias, m5_bos, m5_choch = analyze_structure_bos(candles_5m)
+    ob_high, ob_low, price_in_ob = detect_order_block(candles_5m, tf_bias)
+    eq_highs, eq_lows, swept_high, swept_low = detect_liquidity_zones(candles_5m)
+    liquidity, liq_score = detect_liquidity_grab(candles_5m)
+    fvg, fvg_score       = detect_fvg(candles_5m)
+    pattern, pat_score   = check_candle_pattern(candles_5m)
+    rsi                  = calculate_rsi(candles_5m)
 
     print(f"\n--- ANALYSIS ---")
-    print(f"Price: {current_price:.2f}")
-    print(f"15M Structure: {tf_structure} (score {tf_score})")
-    print(f"M5 Structure: {m5_structure} (score {m5_score})")
-    print(f"Liquidity: {liquidity}")
-    print(f"Pattern: {pattern}")
-    print(f"FVG: {fvg}")
-    print(f"RSI: {rsi}")
-    print(f"Support: {support:.2f} | Resistance: {resistance:.2f}")
+    print(f"Price:       {curr_price:.2f}")
+    print(f"15M Bias:    {tf_bias} | BOS: {bos_type} | CHoCH: {choch}")
+    print(f"M5 Bias:     {m5_bias} | BOS: {m5_bos}")
+    print(f"Order Block: high={ob_high} low={ob_low} in_ob={price_in_ob}")
+    print(f"Eq Highs:    {eq_highs} swept={swept_high}")
+    print(f"Eq Lows:     {eq_lows}  swept={swept_low}")
+    print(f"Liquidity:   {liquidity}")
+    print(f"FVG:         {fvg}")
+    print(f"Pattern:     {pattern}")
+    print(f"RSI:         {rsi}")
 
-    # NOTE: weight (30) was originally calibrated for H1 vs 5M (12x timeframe
-    # ratio). With 15M vs 5M (only 3x ratio), the higher-TF structure carries
-    # less inherent reliability advantage over 5M noise than it did with H1.
-    # Keeping the same weight as requested for now — but be aware this means
-    # the "15M Structure" signal may behave more like a second 5M opinion
-    # than a true higher-timeframe confirmation. Worth watching in your testing.
-    long_score = 0
-    long_reasons = []
+    # --- SCORING ---
+    long_score,  long_reasons  = 0, []
+    short_score, short_reasons = 0, []
 
-    if tf_structure == "BULLISH":
+    # 15M structure (highest weight — non-negotiable direction)
+    if tf_bias == "BULLISH":
         long_score += 30
-        long_reasons.append("15M Bullish Structure")
-    if m5_structure == "BULLISH":
+        long_reasons.append(f"15M Bullish ({bos_type or 'trend'}{'+ CHoCH' if choch else ''})")
+    elif tf_bias == "BEARISH":
+        short_score += 30
+        short_reasons.append(f"15M Bearish ({bos_type or 'trend'}{'+ CHoCH' if choch else ''})")
+
+    # CHoCH bonus (reversal signal = higher conviction)
+    if choch and tf_bias == "BULLISH":
+        long_score += 10
+        long_reasons.append("15M CHoCH Reversal")
+    elif choch and tf_bias == "BEARISH":
+        short_score += 10
+        short_reasons.append("15M CHoCH Reversal")
+
+    # 5M structure alignment
+    if m5_bias == "BULLISH":
         long_score += 15
-        long_reasons.append("M5 Bullish Structure")
-    if liquidity == "BULLISH_GRAB":
+        long_reasons.append(f"M5 Bullish{' BOS' if m5_bos else ''}")
+    elif m5_bias == "BEARISH":
+        short_score += 15
+        short_reasons.append(f"M5 Bearish{' BOS' if m5_bos else ''}")
+
+    # Order block
+    if price_in_ob and tf_bias == "BULLISH":
         long_score += 20
+        long_reasons.append("Price in Bullish Order Block")
+    elif price_in_ob and tf_bias == "BEARISH":
+        short_score += 20
+        short_reasons.append("Price in Bearish Order Block")
+
+    # Liquidity sweep (stop hunt then reversal)
+    if swept_low and tf_bias == "BULLISH":
+        long_score += 15
+        long_reasons.append("Equal Lows Swept (Buy-side liquidity taken)")
+    if swept_high and tf_bias == "BEARISH":
+        short_score += 15
+        short_reasons.append("Equal Highs Swept (Sell-side liquidity taken)")
+
+    # Liquidity grab (wick-based)
+    if liquidity == "BULLISH_GRAB":
+        long_score += 10
         long_reasons.append("Bullish Liquidity Grab")
-    if pattern in ["BULLISH_ENGULF", "HAMMER"]:
-        long_score += pat_score * 8
-        long_reasons.append(f"Pattern: {pattern}")
+    elif liquidity == "BEARISH_GRAB":
+        short_score += 10
+        short_reasons.append("Bearish Liquidity Grab")
+
+    # FVG
     if fvg == "BULLISH_FVG":
         long_score += 10
-        long_reasons.append("Bullish FVG")
-    if near_support:
-        long_score += 10
-        long_reasons.append("Near Support Level")
-    if rsi < 40:
-        long_score += 10
-        long_reasons.append(f"RSI Oversold ({rsi})")
+        long_reasons.append(f"Bullish FVG (≥${MIN_FVG_SIZE})")
+    elif fvg == "BEARISH_FVG":
+        short_score += 10
+        short_reasons.append(f"Bearish FVG (≥${MIN_FVG_SIZE})")
 
-    short_score = 0
-    short_reasons = []
-
-    if tf_structure == "BEARISH":
-        short_score += 30
-        short_reasons.append("15M Bearish Structure")
-    if m5_structure == "BEARISH":
-        short_score += 15
-        short_reasons.append("M5 Bearish Structure")
-    if liquidity == "BEARISH_GRAB":
-        short_score += 20
-        short_reasons.append("Bearish Liquidity Grab")
-    if pattern in ["BEARISH_ENGULF", "SHOOTING_STAR"]:
-        short_score += pat_score * 8
+    # Candlestick pattern
+    if pattern in ["BULLISH_ENGULF", "HAMMER"]:
+        long_score += pat_score * 5
+        long_reasons.append(f"Pattern: {pattern}")
+    elif pattern in ["BEARISH_ENGULF", "SHOOTING_STAR"]:
+        short_score += pat_score * 5
         short_reasons.append(f"Pattern: {pattern}")
-    if fvg == "BEARISH_FVG":
-        short_score += 10
-        short_reasons.append("Bearish FVG")
-    if near_resistance:
-        short_score += 10
-        short_reasons.append("Near Resistance Level")
-    if rsi > 60:
-        short_score += 10
+
+    # RSI
+    if rsi < 35:
+        long_score += 8
+        long_reasons.append(f"RSI Oversold ({rsi})")
+    elif rsi > 65:
+        short_score += 8
         short_reasons.append(f"RSI Overbought ({rsi})")
 
-    print(f"Long Score: {long_score} | Short Score: {short_score}")
+    print(f"Long: {long_score} | Short: {short_score} | Need: {MIN_CONFIDENCE}+")
 
-    signal    = None
-    score     = 0
-    reasons   = []
-    sl_dollars = 0
-    tp_dollars = 0
+    # --- DETERMINE SIGNAL ---
+    signal, score, reasons = None, 0, []
 
-    if long_score > short_score and long_score >= MIN_CONFIDENCE:
-        signal     = "LONG"
-        score      = min(long_score, 99)
-        reasons    = long_reasons
-        sl_dollars = current_price - support
-    elif short_score > long_score and short_score >= MIN_CONFIDENCE:
-        signal     = "SHORT"
-        score      = min(short_score, 99)
-        reasons    = short_reasons
-        sl_dollars = resistance - current_price
+    if long_score > short_score and long_score >= MIN_CONFIDENCE and tf_bias == "BULLISH":
+        signal  = "LONG"
+        score   = min(long_score, 99)
+        reasons = long_reasons
+    elif short_score > long_score and short_score >= MIN_CONFIDENCE and tf_bias == "BEARISH":
+        signal  = "SHORT"
+        score   = min(short_score, 99)
+        reasons = short_reasons
 
     if not signal:
-        print(f"No signal. Long: {long_score} Short: {short_score} (need {MIN_CONFIDENCE}+)")
+        print("No signal.")
         return None
 
-    # Reject if the structural SL distance is outside tradeable bounds for
-    # this account size, rather than silently clamping it.
-    if sl_dollars < MIN_SL_DOLLARS or sl_dollars > MAX_SL_DOLLARS:
-        print(
-            f"Signal rejected: structural SL distance ${sl_dollars:.2f} is outside "
-            f"tradeable range (${MIN_SL_DOLLARS}-${MAX_SL_DOLLARS}) for this capital. "
-            f"This setup may be valid technically but isn't sized for ${CAPITAL} account."
-        )
-        return None
-
+    # Smart SL placement
+    sl_dollars = calculate_sl_distance(
+        candles_5m,
+        "LONG" if signal == "LONG" else "SHORT",
+        ob_high, ob_low
+    )
+    sl_dollars = min(sl_dollars, MAX_SL_DOLLARS)
     tp_dollars = sl_dollars * 2
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
 
     if not is_safe:
-        print(
-            f"Signal rejected: even minimum lot size (0.01) would risk "
-            f"${actual_risk:.2f}, exceeding target risk of ${RISK_AMOUNT:.2f}. "
-            f"This capital base cannot safely take this trade."
-        )
+        print(f"Signal rejected: risk ${actual_risk:.2f} too high.")
         return None
 
     return {
-        "signal":     signal,
-        "price":      current_price,
-        "sl_dollars": round(sl_dollars, 2),
-        "tp_dollars": round(tp_dollars, 2),
-        "lots":       lots,
+        "signal":        signal,
+        "price":         curr_price,
+        "sl_dollars":    round(sl_dollars, 2),
+        "tp_dollars":    round(tp_dollars, 2),
+        "lots":          lots,
         "potential_loss": actual_risk,
-        "confidence": score,
-        "reasons":    reasons,
-        "rsi":        rsi,
-        "support":    support,
-        "resistance": resistance,
-        "tf_bias":    tf_structure,
-        "pattern":    pattern or "None",
-        "liquidity":  liquidity or "None",
-        "fvg":        fvg or "None"
+        "confidence":    score,
+        "reasons":       reasons,
+        "rsi":           rsi,
+        "tf_bias":       tf_bias,
+        "bos_type":      bos_type or "None",
+        "choch":         choch,
+        "ob_high":       ob_high,
+        "ob_low":        ob_low,
+        "price_in_ob":   price_in_ob,
+        "eq_highs":      eq_highs,
+        "eq_lows":       eq_lows,
+        "swept_high":    swept_high,
+        "swept_low":     swept_low,
+        "liquidity":     liquidity or "None",
+        "fvg":           fvg or "None",
+        "pattern":       pattern or "None"
     }
 
 # ============================================
@@ -543,63 +598,57 @@ def send_signal(sig):
 
     reasons_text = "\n".join([f"  ✅ {r}" for r in sig["reasons"]])
     now_ist      = datetime.now(IST).strftime('%d %b %Y %H:%M IST')
-
-    mode_banner = (
-        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n"
-        "<i>Logged for review only. No trade has been placed.</i>\n\n"
-        if PAPER_MODE else
-        "⚠️ <b>LIVE SIGNAL</b>\n\n"
+    mode_banner  = (
+        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n<i>Review only.</i>\n\n"
+        if PAPER_MODE else "⚡ <b>LIVE SIGNAL</b>\n\n"
     )
 
-    msg = f"""
-{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
-━━━━━━━━━━━━━━━━━━━━
+    ob_text = (
+        f"📦 <b>Order Block:</b> {sig['ob_low']:.2f} - {sig['ob_high']:.2f} "
+        f"{'✅ Price inside OB' if sig['price_in_ob'] else ''}\n"
+        if sig["ob_high"] else ""
+    )
+    liq_text = ""
+    if sig["swept_high"]:
+        liq_text = "💧 <b>Liquidity:</b> Equal Highs swept (stop hunt confirmed)\n"
+    elif sig["swept_low"]:
+        liq_text = "💧 <b>Liquidity:</b> Equal Lows swept (stop hunt confirmed)\n"
 
+    msg = f"""{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
+━━━━━━━━━━━━━━━━━━━━
 📊 <b>Direction:</b> {direction}
-💰 <b>Entry:</b> {sig["price"]:.2f} (Market Now)
+💰 <b>Entry:</b> {sig["price"]:.2f} (Market)
 🛑 <b>Stop Loss:</b> {sl_price:.2f} (${sig["sl_dollars"]:.2f} away)
 🎯 <b>Take Profit:</b> {tp_price:.2f} (${sig["tp_dollars"]:.2f} away)
 📦 <b>Lots:</b> {sig["lots"]}
 ⚖️ <b>R:R:</b> 1:2
 🎯 <b>Confidence:</b> {sig["confidence"]}%
-💵 <b>Max Loss If SL Hit:</b> ~${sig["potential_loss"]:.2f}
-   (Target: {RISK_PERCENT*100:.0f}% of ${CAPITAL} capital = ${RISK_AMOUNT:.2f})
-
+💵 <b>Max Risk:</b> ~${sig["potential_loss"]:.2f}
 ━━━━━━━━━━━━━━━━━━━━
-📋 <b>WHY THIS SIGNAL:</b>
+📋 <b>WHY THIS TRADE:</b>
 {reasons_text}
 
-📈 <b>15M Bias:</b> {sig["tf_bias"]}
+📈 <b>15M Bias:</b> {sig["tf_bias"]} | {sig["bos_type"]}{'+ CHoCH🔄' if sig["choch"] else ''}
+{ob_text}{liq_text}📊 <b>FVG:</b> {sig["fvg"]}
 🕯 <b>Pattern:</b> {sig["pattern"]}
-💧 <b>Liquidity:</b> {sig["liquidity"]}
-📊 <b>FVG:</b> {sig["fvg"]}
 📉 <b>RSI:</b> {sig["rsi"]}
-🔴 <b>Resistance:</b> {sig["resistance"]:.2f}
-🟢 <b>Support:</b> {sig["support"]:.2f}
-
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now_ist}
-⚠️ <i>Verify your broker's actual spread and contract size before
-acting on this. Gold spreads vary widely by broker. Max {MAX_TRADES_PER_DAY} signals/day.</i>
-"""
+⚠️ <i>Max {MAX_TRADES_PER_DAY} signals/day. Verify spread before acting.</i>"""
+
     send_telegram(msg)
-    print(f"✅ Signal sent: {sig['signal']} @ {sig['price']} | Confidence: {sig['confidence']}% | Max loss: ${sig['potential_loss']:.2f}")
+    print(f"✅ Signal: {sig['signal']} @ {sig['price']} | "
+          f"Conf: {sig['confidence']}% | Risk: ${sig['potential_loss']:.2f}")
 
 # ============================================
 # SESSION LABEL
 # ============================================
 def get_session():
-    now  = datetime.now(IST)
-    hour = now.hour
-
-    if 5 <= hour < 9:
-        return "Asian Session 🌏"
-    elif 13 <= hour < 18:
-        return "London Session 🇬🇧"
-    elif 18 <= hour < 23:
-        return "New York Session 🗽 (best for gold)"
-    else:
-        return "Off Hours 🌙"
+    h = datetime.now(IST).hour
+    if 5  <= h < 9:  return "Asian Session 🌏"
+    if 13 <= h < 18: return "London Session 🇬🇧"
+    if 18 <= h < 23: return "New York Session 🗽"
+    return "Off Hours 🌙"
 
 # ============================================
 # MAIN LOOP
@@ -607,118 +656,88 @@ def get_session():
 def main():
     global trades_today, last_trade_date, last_signal_direction, last_signal_time
 
-    print("🚀 XAUUSD Bot Starting...")
-    print(f"CAPITAL set to: ${CAPITAL} | Risk per trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:.0f}%)")
-    print(f"PAPER_MODE: {PAPER_MODE}")
-
-    # Honest capital adequacy check — gold's minimum lot size (0.01 = 1oz)
-    # means every $1 of price move = $1 of real risk at minimum size.
-    # If even the smallest tradeable SL distance exceeds the risk target,
-    # this account size genuinely cannot trade gold safely. This isn't a
-    # bug to size around — it's a real constraint of the instrument.
-    min_possible_risk = MIN_SL_DOLLARS * 1.0  # at 0.01 lot, $1 risk per $1 SL
-    if min_possible_risk > RISK_AMOUNT:
-        warning = (
-            f"⚠️ <b>CAPITAL WARNING</b>\n\n"
-            f"With ${CAPITAL} capital and {RISK_PERCENT*100:.0f}% risk target "
-            f"(${RISK_AMOUNT:.2f}), even the smallest tradeable gold position "
-            f"(0.01 lots, ${MIN_SL_DOLLARS} minimum SL) risks ~${min_possible_risk:.2f} — "
-            f"more than your target risk.\n\n"
-            f"Gold's contract size (1oz minimum) doesn't divide finely enough "
-            f"for this account size at this risk level. This bot will keep "
-            f"running in PAPER_MODE for review, but live execution at this "
-            f"capital level is not recommended for XAUUSD specifically."
-        )
-        print(warning.replace("<b>", "").replace("</b>", ""))
-        send_telegram(warning)
+    print("🚀 XAUUSD SMC Bot Starting...")
+    print(f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f} | "
+          f"Min Confidence: {MIN_CONFIDENCE}%")
+    print(f"Paper mode: {PAPER_MODE}")
 
     send_telegram(
-        f"🚀 <b>XAUUSD Signal Bot is LIVE!</b>\n\n"
-        f"{'🧪 <b>PAPER MODE — signals are logged only, not executed</b>' if PAPER_MODE else '⚠️ <b>LIVE MODE</b>'}\n\n"
-        "⚙️ <b>Settings:</b>\n"
-        f"• Capital basis: ${CAPITAL}\n"
-        f"• Risk per trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:.0f}%)\n"
-        f"• Min Confidence: {MIN_CONFIDENCE}%+\n"
-        f"• Max Signals/Day: {MAX_TRADES_PER_DAY}\n"
-        "• Strategy: Structure + Liquidity + S&R + FVG + RSI\n\n"
-        "Scanning every 5 minutes... ⚔️"
+        f"🚀 <b>XAUUSD SMC Bot LIVE</b>\n\n"
+        f"{'🧪 PAPER MODE' if PAPER_MODE else '⚡ LIVE MODE'}\n\n"
+        f"Strategy: BOS + CHoCH + Order Blocks\n"
+        f"+ Liquidity Zones + FVG + Patterns + RSI\n\n"
+        f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
+        f"Min Confidence: {MIN_CONFIDENCE}%\n"
+        f"Max Signals/Day: {MAX_TRADES_PER_DAY}\n"
+        f"Timeframes: 5M + 15M\n\n"
+        f"Scanning every 5 minutes ⚔️"
     )
 
     while True:
         try:
-            now       = datetime.now(IST)
-            today     = date.today()
-            session   = get_session()
+            now   = datetime.now(IST)
+            today = date.today()
 
             if last_trade_date != today:
-                trades_today      = 0
-                last_trade_date   = today
+                trades_today = 0
+                last_trade_date = today
                 last_signal_direction = None
-                print(f"\n📅 New day: {today} — Counter reset")
+                print(f"\n📅 New day: {today}")
                 send_telegram(f"📅 <b>New Day: {today}</b>\nSignals remaining: {MAX_TRADES_PER_DAY}")
 
-            print(f"\n[{now.strftime('%H:%M')}] {session} | Signals today: {trades_today}/{MAX_TRADES_PER_DAY}")
+            session = get_session()
+            print(f"\n[{now.strftime('%H:%M')}] {session} | "
+                  f"Signals: {trades_today}/{MAX_TRADES_PER_DAY}")
 
             if trades_today >= MAX_TRADES_PER_DAY:
-                print("Max signals reached for today. Sleeping 1 hour...")
+                print("Daily limit reached. Sleeping 1hr...")
                 time.sleep(3600)
                 continue
 
-            # Gold has thin liquidity on weekends (futures roll, etc).
-            # Skipping Sat/Sun like forex as a safety default — adjust
-            # if your broker offers weekend gold CFDs you trust.
             if now.weekday() >= 5:
-                print("Weekend — skipping by default. Sleeping 1 hour...")
+                print("Weekend. Sleeping 1hr...")
                 time.sleep(3600)
                 continue
 
             print("Fetching candles...")
             candles_5m = get_candles("5min", 100)
-            time.sleep(2)
+            time.sleep(3)
             candles_15m = get_candles("15min", 100)
 
             if not candles_5m or not candles_15m:
-                print("Failed to fetch candles. Retry in 2 min...")
+                print("Fetch failed. Retry in 2min...")
                 time.sleep(120)
                 continue
 
             sig = generate_signal(candles_5m, candles_15m)
 
             if sig:
-                current_time = time.time()
-                time_since_last = current_time - last_signal_time
-
+                now_ts = time.time()
                 if (last_signal_direction == sig["signal"] and
-                        time_since_last < 2700):
-                    print("Same direction signal within 45min. Skipping...")
+                        now_ts - last_signal_time < 2700):
+                    print("Same direction within 45min — skipping.")
                 else:
                     send_signal(sig)
-                    trades_today          += 1
-                    last_signal_time       = current_time
-                    last_signal_direction  = sig["signal"]
-                    print(f"Signals today: {trades_today}/{MAX_TRADES_PER_DAY}")
-
+                    trades_today         += 1
+                    last_signal_time      = now_ts
+                    last_signal_direction = sig["signal"]
                     if trades_today >= MAX_TRADES_PER_DAY:
                         send_telegram(
-                            f"🔴 <b>Daily Signal Limit Reached!</b>\n"
-                            f"{MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY} signals sent today.\n"
-                            f"Bot resumes tomorrow."
+                            f"🔴 <b>Daily Limit Reached</b>\n"
+                            f"{MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY} signals sent.\n"
+                            f"Resuming tomorrow."
                         )
             else:
-                print("No high confidence signal. Waiting...")
+                print("No signal. Waiting...")
 
-            # Calculate exactly how many seconds remain until the next 5-minute clock boundary (:00, :05, :10)
-            current_timestamp = time.time()
-            seconds_until_next_candle = 300 - (current_timestamp % 300)
-            
-            # Sleep until the candle closes, PLUS 3 seconds to let Twelvedata update their API
-            sleep_time = seconds_until_next_candle + 3
-            print(f"Waiting {int(sleep_time)}s for the next candle to close...")
+            # Clock-sync: wake exactly at next 5M candle close
+            ts        = time.time()
+            sleep_time = (300 - (ts % 300)) + 3
+            print(f"Sleeping {int(sleep_time)}s until next candle close...")
             time.sleep(sleep_time)
 
         except KeyboardInterrupt:
-            print("Bot stopped manually.")
-            send_telegram("🔴 <b>Bot stopped manually.</b>")
+            send_telegram("🔴 <b>Bot stopped.</b>")
             break
         except Exception as e:
             print(f"Error: {e}")
